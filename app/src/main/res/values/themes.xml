@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.PhoneManager" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">#89B4FA</item>
+        <item name="colorPrimaryVariant">#74C7EC</item>
+        <item name="colorOnPrimary">#1E1E2E</item>
+        <item name="colorSecondary">#A6E3A1</item>
+        <item name="colorSecondaryVariant">#94E2D5</item>
+        <item name="colorOnSecondary">#1E1E2E</item>
+        <item name="android:statusBarColor">#1E1E2E</item>
+        <item name="android:navigationBarColor">#1E1E2E</item>
+    </style>
+</resources>
