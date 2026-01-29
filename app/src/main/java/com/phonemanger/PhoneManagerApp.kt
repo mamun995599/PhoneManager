@@ -11,6 +11,7 @@ class PhoneManagerApp : Application() {
     companion object {
         const val TAG = "PhoneManagerApp"
         const val CHANNEL_ID = "PhoneManagerServiceChannel"
+
         lateinit var instance: PhoneManagerApp
             private set
     }
@@ -18,26 +19,33 @@ class PhoneManagerApp : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+
+        Log.d(TAG, "Application onCreate")
         createNotificationChannel()
-        Log.d(TAG, "Application created")
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Phone Manager Service",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Phone Manager background service notification"
-                setShowBadge(false)
-                setSound(null, null)
-                enableVibration(false)
-            }
+            try {
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    "Phone Manager Service",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "Phone Manager background service"
+                    setShowBadge(false)
+                    setSound(null, null)
+                    enableVibration(false)
+                    enableLights(false)
+                }
 
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(channel)
-            Log.d(TAG, "Notification channel created")
+                val manager = getSystemService(NotificationManager::class.java)
+                manager?.createNotificationChannel(channel)
+
+                Log.d(TAG, "Notification channel created")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to create notification channel", e)
+            }
         }
     }
 }

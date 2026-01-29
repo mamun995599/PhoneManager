@@ -1,8 +1,11 @@
 package com.phonemanager.service
 
+import android.app.AlarmManager
 import android.app.Notification
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
@@ -10,6 +13,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -20,6 +24,7 @@ import com.phonemanager.manager.CallLogManager
 import com.phonemanager.manager.CallManager
 import com.phonemanager.manager.CallStateManager
 import com.phonemanager.receiver.CallReceiver
+import com.phonemanager.receiver.RestartReceiver
 import com.phonemanager.server.HttpServerHandler
 import com.phonemanager.server.WebSocketServerHandler
 import com.phonemanager.utils.PreferencesManager
@@ -31,22 +36,27 @@ class PhoneManagerService : Service() {
         const val TAG = "PhoneManagerService"
         const val ACTION_STOP_SERVICE = "com.phonemanager.STOP_SERVICE"
         const val NOTIFICATION_ID = 1
+        const val RESTART_DELAY_MS = 1000L
+
+        @Volatile
+        private var isRunning = false
+
+        fun isRunning() = isRunning
     }
 
     private val binder = LocalBinder()
     private var webSocketServer: WebSocketServerHandler? = null
     private var httpServer: HttpServerHandler? = null
 
-    private lateinit var callManager: CallManager
-    private lateinit var callLogManager: CallLogManager
-    private lateinit var callStateManager: CallStateManager
-    private lateinit var prefsManager: PreferencesManager
+    private var callManager: CallManager? = null
+    private var callLogManager: CallLogManager? = null
+    private var callStateManager: CallStateManager? = null
+    private var prefsManager: PreferencesManager? = null
 
     private var callReceiver: CallReceiver? = null
-
     private var wakeLock: PowerManager.WakeLock? = null
-    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val logListeners = mutableListOf<(String) -> Unit>()
 
     inner class LocalBinder : Binder() {
@@ -56,22 +66,31 @@ class PhoneManagerService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Service onCreate")
+        isRunning = true
 
-        callManager = CallManager(this)
-        callLogManager = CallLogManager(this)
-        callStateManager = CallStateManager(this)
-        prefsManager = PreferencesManager(this)
+        try {
+            // Initialize managers
+            callManager = CallManager(this)
+            callLogManager = CallLogManager(this)
+            callStateManager = CallStateManager(this)
+            prefsManager = PreferencesManager(this)
 
-        // Start listening for call state changes
-        callStateManager.startListening()
+            // Start listening for call state changes
+            callStateManager?.startListening()
 
-        // Register broadcast receiver for call events
-        registerCallReceiver()
+            // Register broadcast receiver
+            registerCallReceiver()
 
-        // Add listener for call state changes
-        CallStateManager.addCallStateListener { state, number ->
-            notifyLog("Call state: ${CallStateManager.getStateName(state)}, Number: $number")
-            broadcastCallState(state, number)
+            // Add call state listener
+            CallStateManager.addCallStateListener { state, number ->
+                notifyLog("Call: ${CallStateManager.getStateName(state)} - $number")
+                broadcastCallState(state, number)
+            }
+
+            Log.d(TAG, "Service onCreate completed successfully")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in onCreate", e)
         }
     }
 
@@ -81,6 +100,7 @@ class PhoneManagerService : Service() {
             val filter = IntentFilter().apply {
                 addAction(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
                 addAction(Intent.ACTION_NEW_OUTGOING_CALL)
+                priority = 1000
             }
             registerReceiver(callReceiver, filter)
             Log.d(TAG, "CallReceiver registered")
@@ -93,16 +113,15 @@ class PhoneManagerService : Service() {
         try {
             callReceiver?.let {
                 unregisterReceiver(it)
-                Log.d(TAG, "CallReceiver unregistered")
             }
             callReceiver = null
+            Log.d(TAG, "CallReceiver unregistered")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to unregister CallReceiver", e)
+            Log.e(TAG, "Error unregistering CallReceiver", e)
         }
     }
 
     private fun broadcastCallState(state: Int, number: String?) {
-        // Broadcast to WebSocket clients
         webSocketServer?.let { server ->
             try {
                 val stateInfo = mapOf(
@@ -123,14 +142,27 @@ class PhoneManagerService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder {
+        Log.d(TAG, "onBind called")
         return binder
     }
 
+    override fun onUnbind(intent: Intent?): Boolean {
+        Log.d(TAG, "onUnbind called")
+        return super.onUnbind(intent)
+    }
+
+    override fun onRebind(intent: Intent?) {
+        Log.d(TAG, "onRebind called")
+        super.onRebind(intent)
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d(TAG, "Service onStartCommand: ${intent?.action}")
+        Log.d(TAG, "onStartCommand: action=${intent?.action}")
 
         when (intent?.action) {
             ACTION_STOP_SERVICE -> {
+                Log.d(TAG, "Stop service requested")
+                prefsManager?.serviceEnabled = false
                 stopServers()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -142,8 +174,15 @@ class PhoneManagerService : Service() {
             startForegroundWithNotification()
             acquireWakeLock()
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start foreground: ${e.message}")
-            e.printStackTrace()
+            Log.e(TAG, "Error starting foreground", e)
+
+            // Try simpler notification as fallback
+            try {
+                val notification = createSimpleNotification()
+                startForeground(NOTIFICATION_ID, notification)
+            } catch (e2: Exception) {
+                Log.e(TAG, "Even simple notification failed", e2)
+            }
         }
 
         return START_STICKY
@@ -152,39 +191,26 @@ class PhoneManagerService : Service() {
     private fun startForegroundWithNotification() {
         val notification = createNotification()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE
-            )
-        } else {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                // Android 14+
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Android 10-13
+                startForeground(NOTIFICATION_ID, notification, 0)
+            } else {
+                // Android 9 and below
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            Log.d(TAG, "Foreground service started")
+        } catch (e: Exception) {
+            Log.e(TAG, "startForeground failed, trying fallback", e)
             startForeground(NOTIFICATION_ID, notification)
         }
-
-        Log.d(TAG, "Foreground service started successfully")
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        Log.d(TAG, "Service onDestroy")
-
-        callStateManager.stopListening()
-        unregisterCallReceiver()
-        stopServers()
-        releaseWakeLock()
-        serviceScope.cancel()
-    }
-
-    private fun stopServers() {
-        stopWebSocketServer()
-        stopHttpServer()
     }
 
     private fun createNotification(): Notification {
@@ -204,9 +230,15 @@ class PhoneManagerService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val statusText = buildString {
+            append("Running")
+            if (webSocketServer != null) append(" | WS:${prefsManager?.webSocketPort ?: 8030}")
+            if (httpServer != null) append(" | HTTP:${prefsManager?.httpPort ?: 8040}")
+        }
+
         return NotificationCompat.Builder(this, PhoneManagerApp.CHANNEL_ID)
             .setContentTitle("Phone Manager")
-            .setContentText("Servers are running in background")
+            .setContentText(statusText)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(openPendingIntent)
             .addAction(R.drawable.ic_stop, "Stop", stopPendingIntent)
@@ -217,18 +249,41 @@ class PhoneManagerService : Service() {
             .build()
     }
 
+    private fun createSimpleNotification(): Notification {
+        return NotificationCompat.Builder(this, PhoneManagerApp.CHANNEL_ID)
+            .setContentTitle("Phone Manager")
+            .setContentText("Running")
+            .setSmallIcon(R.drawable.ic_notification)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
+    private fun updateNotification() {
+        try {
+            val notification = createNotification()
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.notify(NOTIFICATION_ID, notification)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update notification", e)
+        }
+    }
+
     private fun acquireWakeLock() {
         try {
-            val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "PhoneManager::ServiceWakeLock"
-            ).apply {
-                acquire(10 * 60 * 1000L)
+            if (wakeLock == null) {
+                val powerManager = getSystemService(POWER_SERVICE) as PowerManager
+                wakeLock = powerManager.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "PhoneManager::ServiceWakeLock"
+                ).apply {
+                    setReferenceCounted(false)
+                    acquire(60 * 60 * 1000L) // 1 hour, will be renewed
+                }
+                Log.d(TAG, "WakeLock acquired")
             }
-            Log.d(TAG, "WakeLock acquired")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to acquire WakeLock: ${e.message}")
+            Log.e(TAG, "Failed to acquire WakeLock", e)
         }
     }
 
@@ -240,26 +295,116 @@ class PhoneManagerService : Service() {
                     Log.d(TAG, "WakeLock released")
                 }
             }
+            wakeLock = null
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to release WakeLock: ${e.message}")
+            Log.e(TAG, "Error releasing WakeLock", e)
         }
     }
 
-    // WebSocket Server Control
+    override fun onDestroy() {
+        Log.d(TAG, "Service onDestroy")
+        isRunning = false
+
+        try {
+            callStateManager?.stopListening()
+            unregisterCallReceiver()
+            stopServers()
+            releaseWakeLock()
+            serviceScope.cancel()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in onDestroy", e)
+        }
+
+        // Schedule restart if service was not intentionally stopped
+        if (prefsManager?.serviceEnabled == true) {
+            scheduleRestart()
+        }
+
+        super.onDestroy()
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.d(TAG, "onTaskRemoved")
+
+        if (prefsManager?.serviceEnabled == true) {
+            scheduleRestart()
+        }
+
+        super.onTaskRemoved(rootIntent)
+    }
+
+    private fun scheduleRestart() {
+        try {
+            Log.d(TAG, "Scheduling service restart")
+
+            val restartIntent = Intent(this, RestartReceiver::class.java).apply {
+                action = RestartReceiver.ACTION_RESTART
+            }
+
+            val pendingIntent = PendingIntent.getBroadcast(
+                this,
+                0,
+                restartIntent,
+                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setExactAndAllowWhileIdle(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    SystemClock.elapsedRealtime() + RESTART_DELAY_MS,
+                    pendingIntent
+                )
+            } else {
+                alarmManager.setExact(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    SystemClock.elapsedRealtime() + RESTART_DELAY_MS,
+                    pendingIntent
+                )
+            }
+
+            Log.d(TAG, "Restart scheduled")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to schedule restart", e)
+        }
+    }
+
+    private fun stopServers() {
+        stopWebSocketServer()
+        stopHttpServer()
+    }
+
+    // ========== WebSocket Server ==========
+
     fun startWebSocketServer(port: Int): Boolean {
+        val manager = callManager
+        val logManager = callLogManager
+
+        if (manager == null || logManager == null) {
+            Log.e(TAG, "Managers not initialized")
+            notifyLog("Error: Service not fully initialized")
+            return false
+        }
+
         return try {
             stopWebSocketServer()
 
-            webSocketServer = WebSocketServerHandler(port, callManager, callLogManager) { log ->
+            webSocketServer = WebSocketServerHandler(port, manager, logManager) { log ->
                 notifyLog(log)
             }
             webSocketServer?.start()
+
+            prefsManager?.webSocketPort = port
+            prefsManager?.webSocketEnabled = true
+
+            updateNotification()
             notifyLog("WebSocket server started on port $port")
             Log.d(TAG, "WebSocket server started on port $port")
             true
         } catch (e: Exception) {
-            notifyLog("WebSocket server failed: ${e.message}")
             Log.e(TAG, "WebSocket server failed", e)
+            notifyLog("WebSocket failed: ${e.message}")
             false
         }
     }
@@ -272,29 +417,45 @@ class PhoneManagerService : Service() {
                 Log.d(TAG, "WebSocket server stopped")
             }
             webSocketServer = null
+            prefsManager?.webSocketEnabled = false
+            updateNotification()
         } catch (e: Exception) {
-            Log.e(TAG, "WebSocket stop error: ${e.message}")
-            notifyLog("WebSocket stop error: ${e.message}")
+            Log.e(TAG, "WebSocket stop error", e)
         }
     }
 
     fun isWebSocketRunning(): Boolean = webSocketServer != null
 
-    // HTTP Server Control
+    // ========== HTTP Server ==========
+
     fun startHttpServer(port: Int): Boolean {
+        val manager = callManager
+        val logManager = callLogManager
+
+        if (manager == null || logManager == null) {
+            Log.e(TAG, "Managers not initialized")
+            notifyLog("Error: Service not fully initialized")
+            return false
+        }
+
         return try {
             stopHttpServer()
 
-            httpServer = HttpServerHandler(port, callManager, callLogManager) { log ->
+            httpServer = HttpServerHandler(port, manager, logManager) { log ->
                 notifyLog(log)
             }
             httpServer?.start()
+
+            prefsManager?.httpPort = port
+            prefsManager?.httpEnabled = true
+
+            updateNotification()
             notifyLog("HTTP server started on port $port")
             Log.d(TAG, "HTTP server started on port $port")
             true
         } catch (e: Exception) {
-            notifyLog("HTTP server failed: ${e.message}")
             Log.e(TAG, "HTTP server failed", e)
+            notifyLog("HTTP failed: ${e.message}")
             false
         }
     }
@@ -307,17 +468,21 @@ class PhoneManagerService : Service() {
                 Log.d(TAG, "HTTP server stopped")
             }
             httpServer = null
+            prefsManager?.httpEnabled = false
+            updateNotification()
         } catch (e: Exception) {
-            Log.e(TAG, "HTTP stop error: ${e.message}")
-            notifyLog("HTTP stop error: ${e.message}")
+            Log.e(TAG, "HTTP stop error", e)
         }
     }
 
     fun isHttpRunning(): Boolean = httpServer != null
 
-    // Log listeners
+    // ========== Log Listeners ==========
+
     fun addLogListener(listener: (String) -> Unit) {
-        logListeners.add(listener)
+        if (!logListeners.contains(listener)) {
+            logListeners.add(listener)
+        }
     }
 
     fun removeLogListener(listener: (String) -> Unit) {
@@ -329,12 +494,14 @@ class PhoneManagerService : Service() {
             .format(java.util.Date())
         val logMessage = "[$timestamp] $message"
 
+        Log.d(TAG, logMessage)
+
         serviceScope.launch(Dispatchers.Main) {
-            logListeners.forEach {
+            logListeners.forEach { listener ->
                 try {
-                    it(logMessage)
+                    listener(logMessage)
                 } catch (e: Exception) {
-                    Log.e(TAG, "Log listener error: ${e.message}")
+                    Log.e(TAG, "Log listener error", e)
                 }
             }
         }

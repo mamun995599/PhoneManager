@@ -4,13 +4,17 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.CallLog
 import android.telecom.Call
+import android.telecom.CallAudioState
 import android.telecom.TelecomManager
 import android.telecom.PhoneAccountHandle
 import android.telephony.TelephonyManager
@@ -19,6 +23,7 @@ import androidx.core.app.ActivityCompat
 import com.phonemanager.model.ActiveCallInfo
 import com.phonemanager.model.CommandResponse
 import com.phonemanager.service.CallControlService
+import java.net.URLDecoder
 
 class CallManager(private val context: Context) {
 
@@ -36,59 +41,131 @@ class CallManager(private val context: Context) {
         context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
     private val handler = Handler(Looper.getMainLooper())
 
-    // Dial number or USSD
+    private var audioFocusRequest: AudioFocusRequest? = null
+
+    /**
+     * Dial a phone number or execute USSD code
+     * Works in background without requiring an Activity
+     */
     fun dial(number: String, simSlot: Int, isUssd: Boolean): CommandResponse {
         return try {
             Log.d(TAG, "Dialing: $number on SIM$simSlot, isUSSD: $isUssd")
 
-            val phoneAccountHandle = getPhoneAccountHandle(simSlot)
+            // Process the number
+            var processedNumber = number.trim()
 
-            val formattedNumber = if (isUssd) {
-                Uri.encode(number)
-            } else {
-                number.replace(" ", "").replace("-", "")
+            // URL decode in case it was encoded
+            processedNumber = try {
+                URLDecoder.decode(processedNumber, "UTF-8")
+            } catch (e: Exception) {
+                processedNumber
             }
 
-            val uri = Uri.parse("tel:$formattedNumber")
-
-            val extras = android.os.Bundle().apply {
-                phoneAccountHandle?.let {
-                    putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, it)
-                }
+            // For USSD codes, ensure it ends with #
+            if (isUssd && !processedNumber.endsWith("#")) {
+                processedNumber = "$processedNumber#"
             }
 
+            Log.d(TAG, "Final number to dial: $processedNumber")
+
+            // Check permission
             if (ActivityCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE)
-                == PackageManager.PERMISSION_GRANTED) {
-
-                // Store outgoing number
-                CallStateManager.currentCallNumber = number
-                CallStateManager.isIncoming = false
-
-                val intent = Intent(Intent.ACTION_CALL, uri).apply {
-                    putExtras(extras)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                context.startActivity(intent)
-
-                Log.d(TAG, "Call initiated successfully")
-                CommandResponse(
-                    success = true,
-                    message = if (isUssd) "USSD code sent: $number on SIM$simSlot"
-                    else "Dialing: $number on SIM$simSlot"
-                )
-            } else {
-                Log.e(TAG, "CALL_PHONE permission not granted")
-                CommandResponse(
+                != PackageManager.PERMISSION_GRANTED) {
+                return CommandResponse(
                     success = false,
                     message = "CALL_PHONE permission not granted"
                 )
             }
+
+            // Store outgoing number
+            CallStateManager.currentCallNumber = processedNumber
+            CallStateManager.isIncoming = false
+
+            // Get phone account for SIM selection
+            val phoneAccountHandle = getPhoneAccountHandle(simSlot)
+
+            // Method 1: Use TelecomManager.placeCall() - Works in background
+            val success = placeCallViaTelecom(processedNumber, phoneAccountHandle)
+
+            if (success) {
+                CommandResponse(
+                    success = true,
+                    message = if (isUssd) "USSD code sent: $processedNumber on SIM$simSlot"
+                    else "Dialing: $processedNumber on SIM$simSlot"
+                )
+            } else {
+                // Fallback: Use Intent with FLAG_ACTIVITY_NEW_TASK
+                placeCallViaIntent(processedNumber, phoneAccountHandle, isUssd)
+            }
+
         } catch (e: Exception) {
             Log.e(TAG, "Dial failed", e)
             CommandResponse(
                 success = false,
                 message = "Dial failed: ${e.message}"
             )
+        }
+    }
+
+    /**
+     * Place call using TelecomManager - Works in background
+     */
+    private fun placeCallViaTelecom(number: String, phoneAccountHandle: PhoneAccountHandle?): Boolean {
+        return try {
+            if (ActivityCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE)
+                == PackageManager.PERMISSION_GRANTED) {
+
+                val uri = Uri.fromParts("tel", number, null)
+                val extras = Bundle().apply {
+                    phoneAccountHandle?.let {
+                        putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, it)
+                    }
+                    putBoolean(TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE, false)
+                }
+
+                telecomManager.placeCall(uri, extras)
+                Log.d(TAG, "Call placed via TelecomManager")
+                true
+            } else {
+                false
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "TelecomManager.placeCall failed", e)
+            false
+        }
+    }
+
+    /**
+     * Fallback: Place call using Intent
+     */
+    private fun placeCallViaIntent(
+        number: String,
+        phoneAccountHandle: PhoneAccountHandle?,
+        isUssd: Boolean
+    ): CommandResponse {
+        return try {
+            val uri = Uri.parse("tel:${Uri.encode(number)}")
+
+            val intent = Intent(Intent.ACTION_CALL, uri).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_ACTIVITY_NO_USER_ACTION)
+                addFlags(Intent.FLAG_FROM_BACKGROUND)
+
+                phoneAccountHandle?.let {
+                    putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, it)
+                }
+            }
+
+            context.startActivity(intent)
+            Log.d(TAG, "Call placed via Intent")
+
+            CommandResponse(
+                success = true,
+                message = if (isUssd) "USSD code sent: $number" else "Dialing: $number"
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Intent call failed", e)
+            CommandResponse(success = false, message = "Dial failed: ${e.message}")
         }
     }
 
@@ -99,6 +176,10 @@ class CallManager(private val context: Context) {
 
                 val accounts = telecomManager.callCapablePhoneAccounts
                 Log.d(TAG, "Available phone accounts: ${accounts.size}")
+
+                accounts.forEachIndexed { index, account ->
+                    Log.d(TAG, "Account $index: $account")
+                }
 
                 if (accounts.size > simSlot - 1 && simSlot > 0) {
                     accounts[simSlot - 1]
@@ -129,6 +210,7 @@ class CallManager(private val context: Context) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)
                     == PackageManager.PERMISSION_GRANTED) {
+                    @Suppress("DEPRECATION")
                     telecomManager.acceptRingingCall()
                     Log.d(TAG, "Call answered via TelecomManager")
                     CommandResponse(success = true, message = "Call answered")
@@ -152,11 +234,10 @@ class CallManager(private val context: Context) {
             val call = CallControlService.currentCall
             if (call != null && call.state == Call.STATE_RINGING) {
                 call.reject(false, null)
-                Log.d(TAG, "Call rejected")
+                Log.d(TAG, "Call rejected via InCallService")
                 return CommandResponse(success = true, message = "Call rejected")
             }
 
-            // Fallback
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)
                     == PackageManager.PERMISSION_GRANTED) {
@@ -192,8 +273,10 @@ class CallManager(private val context: Context) {
                     == PackageManager.PERMISSION_GRANTED) {
                     @Suppress("DEPRECATION")
                     val ended = telecomManager.endCall()
-                    Log.d(TAG, "Call terminated via TelecomManager: $ended")
-                    CommandResponse(success = ended, message = if (ended) "Call terminated" else "Failed to terminate call")
+                    CommandResponse(
+                        success = ended,
+                        message = if (ended) "Call terminated" else "Failed to terminate"
+                    )
                 } else {
                     CommandResponse(success = false, message = "Permission not granted")
                 }
@@ -212,10 +295,9 @@ class CallManager(private val context: Context) {
             val call = CallControlService.currentCall
             if (call != null && call.state == Call.STATE_ACTIVE) {
                 call.hold()
-                Log.d(TAG, "Call on hold")
                 CommandResponse(success = true, message = "Call on hold")
             } else {
-                CommandResponse(success = false, message = "No active call to hold (requires default dialer)")
+                CommandResponse(success = false, message = "No active call to hold")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Hold failed", e)
@@ -229,10 +311,9 @@ class CallManager(private val context: Context) {
             val call = CallControlService.currentCall
             if (call != null && call.state == Call.STATE_HOLDING) {
                 call.unhold()
-                Log.d(TAG, "Call resumed")
                 CommandResponse(success = true, message = "Call resumed")
             } else {
-                CommandResponse(success = false, message = "No held call to resume (requires default dialer)")
+                CommandResponse(success = false, message = "No held call to resume")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Unhold failed", e)
@@ -243,12 +324,27 @@ class CallManager(private val context: Context) {
     // Mute microphone
     fun mute(): CommandResponse {
         return try {
+            Log.d(TAG, "Attempting to mute")
+
+            // Method 1: Use InCallService
+            val service = CallControlService.getInstance()
+            if (service != null) {
+                val success = service.muteCall(true)  // CHANGED: setMuted -> muteCall
+                if (success) {
+                    isMuted = true
+                    Log.d(TAG, "Muted via InCallService")
+                    return CommandResponse(success = true, message = "Microphone muted")
+                }
+            }
+
+            // Method 2: Use AudioManager
             handler.post {
                 audioManager.isMicrophoneMute = true
             }
             isMuted = true
-            Log.d(TAG, "Microphone muted")
+            Log.d(TAG, "Muted via AudioManager")
             CommandResponse(success = true, message = "Microphone muted")
+
         } catch (e: Exception) {
             Log.e(TAG, "Mute failed", e)
             CommandResponse(success = false, message = "Mute failed: ${e.message}")
@@ -258,12 +354,27 @@ class CallManager(private val context: Context) {
     // Unmute microphone
     fun unmute(): CommandResponse {
         return try {
+            Log.d(TAG, "Attempting to unmute")
+
+            // Method 1: Use InCallService
+            val service = CallControlService.getInstance()
+            if (service != null) {
+                val success = service.muteCall(false)  // CHANGED: setMuted -> muteCall
+                if (success) {
+                    isMuted = false
+                    Log.d(TAG, "Unmuted via InCallService")
+                    return CommandResponse(success = true, message = "Microphone unmuted")
+                }
+            }
+
+            // Method 2: Use AudioManager
             handler.post {
                 audioManager.isMicrophoneMute = false
             }
             isMuted = false
-            Log.d(TAG, "Microphone unmuted")
+            Log.d(TAG, "Unmuted via AudioManager")
             CommandResponse(success = true, message = "Microphone unmuted")
+
         } catch (e: Exception) {
             Log.e(TAG, "Unmute failed", e)
             CommandResponse(success = false, message = "Unmute failed: ${e.message}")
@@ -273,36 +384,62 @@ class CallManager(private val context: Context) {
     // Enable loudspeaker
     fun speakerOn(): CommandResponse {
         return try {
-            Log.d(TAG, "Enabling speaker...")
+            Log.d(TAG, "Attempting to enable speaker")
 
+            // Method 1: Use InCallService (Best method for calls)
+            val service = CallControlService.getInstance()
+            if (service != null) {
+                val success = service.routeToSpeaker(true)  // CHANGED: setSpeakerOn -> routeToSpeaker
+                if (success) {
+                    isSpeakerOn = true
+                    Log.d(TAG, "Speaker enabled via InCallService")
+                    return CommandResponse(success = true, message = "Loudspeaker enabled")
+                }
+            }
+
+            // Method 2: Use AudioManager with proper sequence
             handler.post {
                 try {
+                    // Request audio focus first
+                    requestAudioFocus()
+
+                    // Set mode
                     audioManager.mode = AudioManager.MODE_IN_CALL
+
+                    // Enable speaker
                     audioManager.isSpeakerphoneOn = true
 
+                    // For Android 12+
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        val devices = audioManager.availableCommunicationDevices
-                        val speaker = devices.find {
-                            it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-                        }
-                        speaker?.let {
-                            audioManager.setCommunicationDevice(it)
+                        try {
+                            val devices = audioManager.availableCommunicationDevices
+                            val speaker = devices.find {
+                                it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                            }
+                            speaker?.let {
+                                val result = audioManager.setCommunicationDevice(it)
+                                Log.d(TAG, "setCommunicationDevice result: $result")
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "setCommunicationDevice failed", e)
                         }
                     }
 
                     isSpeakerOn = true
-                    Log.d(TAG, "Speaker enabled: ${audioManager.isSpeakerphoneOn}")
+                    Log.d(TAG, "Speaker enabled via AudioManager: ${audioManager.isSpeakerphoneOn}")
                 } catch (e: Exception) {
-                    Log.e(TAG, "Speaker on failed in handler", e)
+                    Log.e(TAG, "Speaker enable failed in handler", e)
                 }
             }
 
-            Thread.sleep(100)
+            // Wait for handler to complete
+            Thread.sleep(200)
 
             CommandResponse(
                 success = true,
-                message = "Loudspeaker enabled"
+                message = "Loudspeaker enabled (Speaker: ${audioManager.isSpeakerphoneOn})"
             )
+
         } catch (e: Exception) {
             Log.e(TAG, "Speaker on failed", e)
             CommandResponse(success = false, message = "Speaker on failed: ${e.message}")
@@ -312,44 +449,88 @@ class CallManager(private val context: Context) {
     // Disable loudspeaker
     fun speakerOff(): CommandResponse {
         return try {
-            Log.d(TAG, "Disabling speaker...")
+            Log.d(TAG, "Attempting to disable speaker")
 
+            // Method 1: Use InCallService
+            val service = CallControlService.getInstance()
+            if (service != null) {
+                val success = service.routeToSpeaker(false)  // CHANGED: setSpeakerOn -> routeToSpeaker
+                if (success) {
+                    isSpeakerOn = false
+                    Log.d(TAG, "Speaker disabled via InCallService")
+                    return CommandResponse(success = true, message = "Loudspeaker disabled")
+                }
+            }
+
+            // Method 2: Use AudioManager
             handler.post {
                 try {
                     audioManager.isSpeakerphoneOn = false
 
+                    // For Android 12+
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        val devices = audioManager.availableCommunicationDevices
-                        val earpiece = devices.find {
-                            it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
-                        }
-                        earpiece?.let {
-                            audioManager.setCommunicationDevice(it)
+                        try {
+                            val devices = audioManager.availableCommunicationDevices
+                            val earpiece = devices.find {
+                                it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                            }
+                            earpiece?.let {
+                                audioManager.setCommunicationDevice(it)
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "setCommunicationDevice failed", e)
                         }
                     }
 
                     isSpeakerOn = false
-                    Log.d(TAG, "Speaker disabled: ${audioManager.isSpeakerphoneOn}")
+                    Log.d(TAG, "Speaker disabled via AudioManager: ${audioManager.isSpeakerphoneOn}")
                 } catch (e: Exception) {
-                    Log.e(TAG, "Speaker off failed in handler", e)
+                    Log.e(TAG, "Speaker disable failed in handler", e)
                 }
             }
 
-            Thread.sleep(100)
+            Thread.sleep(200)
 
             CommandResponse(
                 success = true,
-                message = "Loudspeaker disabled"
+                message = "Loudspeaker disabled (Speaker: ${audioManager.isSpeakerphoneOn})"
             )
+
         } catch (e: Exception) {
             Log.e(TAG, "Speaker off failed", e)
             CommandResponse(success = false, message = "Speaker off failed: ${e.message}")
         }
     }
 
+    private fun requestAudioFocus() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+
+            audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(audioAttributes)
+                .setAcceptsDelayedFocusGain(true)
+                .setOnAudioFocusChangeListener { }
+                .build()
+
+            audioManager.requestAudioFocus(audioFocusRequest!!)
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(
+                null,
+                AudioManager.STREAM_VOICE_CALL,
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+            )
+        }
+    }
+
     // Get audio status
     fun getAudioStatus(): CommandResponse {
         return try {
+            val callAudioState = CallControlService.getInstance()?.getCurrentAudioState()
+
             val status = mapOf(
                 "speaker_on" to audioManager.isSpeakerphoneOn,
                 "microphone_muted" to audioManager.isMicrophoneMute,
@@ -357,7 +538,9 @@ class CallManager(private val context: Context) {
                 "volume_call" to audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL),
                 "volume_max" to audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL),
                 "bluetooth_sco_on" to audioManager.isBluetoothScoOn,
-                "wired_headset_on" to audioManager.isWiredHeadsetOn
+                "wired_headset_on" to audioManager.isWiredHeadsetOn,
+                "call_audio_route" to (callAudioState?.route?.let { getAudioRouteName(it) } ?: "N/A"),
+                "call_is_muted" to (callAudioState?.isMuted ?: false)
             )
 
             CommandResponse(
@@ -381,15 +564,27 @@ class CallManager(private val context: Context) {
         }
     }
 
-    // Get active call info - IMPROVED VERSION
+    private fun getAudioRouteName(route: Int): String {
+        return when (route) {
+            CallAudioState.ROUTE_EARPIECE -> "EARPIECE"
+            CallAudioState.ROUTE_SPEAKER -> "SPEAKER"
+            CallAudioState.ROUTE_WIRED_HEADSET -> "WIRED_HEADSET"
+            CallAudioState.ROUTE_BLUETOOTH -> "BLUETOOTH"
+            else -> "UNKNOWN ($route)"
+        }
+    }
+
+    // Get active call info - COMPLETE VERSION
     fun getActiveCallInfo(): CommandResponse {
         return try {
             Log.d(TAG, "Getting active call info...")
 
-            // Method 1: Try InCallService (works if app is default dialer)
+            // Method 1: Try InCallService
             val inCallServiceCall = CallControlService.currentCall
             if (inCallServiceCall != null) {
                 val details = inCallServiceCall.details
+                val callAudioState = CallControlService.getInstance()?.getCurrentAudioState()
+
                 val callInfo = ActiveCallInfo(
                     number = details?.handle?.schemeSpecificPart,
                     state = getCallStateName(inCallServiceCall.state),
@@ -398,11 +593,12 @@ class CallManager(private val context: Context) {
                     } ?: 0,
                     isIncoming = CallControlService.isIncoming,
                     startTime = CallControlService.callStartTime ?: 0,
-                    isMuted = audioManager.isMicrophoneMute,
+                    isMuted = callAudioState?.isMuted ?: audioManager.isMicrophoneMute,
                     isOnHold = inCallServiceCall.state == Call.STATE_HOLDING,
-                    isSpeakerOn = audioManager.isSpeakerphoneOn
+                    isSpeakerOn = callAudioState?.route == CallAudioState.ROUTE_SPEAKER
+                            || audioManager.isSpeakerphoneOn
                 )
-                Log.d(TAG, "Got call info from InCallService: $callInfo")
+                Log.d(TAG, "Got call info from InCallService")
                 return CommandResponse(
                     success = true,
                     message = "Active call info retrieved (via InCallService)",
@@ -410,7 +606,7 @@ class CallManager(private val context: Context) {
                 )
             }
 
-            // Method 2: Use CallStateManager (TelephonyManager listener)
+            // Method 2: Use CallStateManager
             if (CallStateManager.isCallActive ||
                 CallStateManager.currentCallState != TelephonyManager.CALL_STATE_IDLE) {
 
@@ -426,7 +622,7 @@ class CallManager(private val context: Context) {
                     isOnHold = false,
                     isSpeakerOn = audioManager.isSpeakerphoneOn
                 )
-                Log.d(TAG, "Got call info from CallStateManager: $callInfo")
+                Log.d(TAG, "Got call info from CallStateManager")
                 return CommandResponse(
                     success = true,
                     message = "Active call info retrieved (via TelephonyManager)",
@@ -435,6 +631,7 @@ class CallManager(private val context: Context) {
             }
 
             // Method 3: Check TelephonyManager directly
+            @Suppress("DEPRECATION")
             val callState = telephonyManager.callState
             if (callState != TelephonyManager.CALL_STATE_IDLE) {
                 val lastNumber = getLastDialedNumber() ?: getLastReceivedNumber()
@@ -452,14 +649,15 @@ class CallManager(private val context: Context) {
                     isOnHold = false,
                     isSpeakerOn = audioManager.isSpeakerphoneOn
                 )
-                Log.d(TAG, "Got call info from TelephonyManager direct: $callInfo")
+                Log.d(TAG, "Got call info from TelephonyManager direct")
                 return CommandResponse(
                     success = true,
-                    message = "Active call info retrieved (via TelephonyManager direct)",
+                    message = "Active call info retrieved",
                     data = callInfo
                 )
             }
 
+            // No active call
             Log.d(TAG, "No active call found")
             CommandResponse(
                 success = true,
@@ -480,7 +678,7 @@ class CallManager(private val context: Context) {
 
                 val cursor = context.contentResolver.query(
                     CallLog.Calls.CONTENT_URI,
-                    arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.TYPE, CallLog.Calls.DATE),
+                    arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.DATE),
                     "${CallLog.Calls.TYPE} = ?",
                     arrayOf(CallLog.Calls.OUTGOING_TYPE.toString()),
                     "${CallLog.Calls.DATE} DESC"
@@ -489,10 +687,8 @@ class CallManager(private val context: Context) {
                 cursor?.use {
                     if (it.moveToFirst()) {
                         val number = it.getString(0)
-                        val date = it.getLong(2)
-                        // Only return if call was in last 60 seconds
+                        val date = it.getLong(1)
                         if (System.currentTimeMillis() - date < 60000) {
-                            Log.d(TAG, "Last dialed number: $number")
                             return number
                         }
                     }
@@ -512,7 +708,7 @@ class CallManager(private val context: Context) {
 
                 val cursor = context.contentResolver.query(
                     CallLog.Calls.CONTENT_URI,
-                    arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.TYPE, CallLog.Calls.DATE),
+                    arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.DATE),
                     "${CallLog.Calls.TYPE} IN (?, ?)",
                     arrayOf(
                         CallLog.Calls.INCOMING_TYPE.toString(),
@@ -524,10 +720,8 @@ class CallManager(private val context: Context) {
                 cursor?.use {
                     if (it.moveToFirst()) {
                         val number = it.getString(0)
-                        val date = it.getLong(2)
-                        // Only return if call was in last 60 seconds
+                        val date = it.getLong(1)
                         if (System.currentTimeMillis() - date < 60000) {
-                            Log.d(TAG, "Last received number: $number")
                             return number
                         }
                     }
@@ -551,8 +745,6 @@ class CallManager(private val context: Context) {
             Call.STATE_CONNECTING -> "CONNECTING"
             Call.STATE_DISCONNECTING -> "DISCONNECTING"
             Call.STATE_SELECT_PHONE_ACCOUNT -> "SELECT_PHONE_ACCOUNT"
-            Call.STATE_SIMULATED_RINGING -> "SIMULATED_RINGING"
-            Call.STATE_AUDIO_PROCESSING -> "AUDIO_PROCESSING"
             else -> "UNKNOWN ($state)"
         }
     }

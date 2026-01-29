@@ -10,4 +10,13 @@
         <item name="android:statusBarColor">#1E1E2E</item>
         <item name="android:navigationBarColor">#1E1E2E</item>
     </style>
+
+    <!-- Transparent theme for DialerActivity -->
+    <style name="Theme.PhoneManager.Transparent" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
 </resources>
